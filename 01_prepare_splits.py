@@ -65,25 +65,138 @@ def load_annotations(annotations_dir: Path) -> pd.DataFrame:
     return quality_df
 
 
-def build_participant_date_mapping(extracted_data_dir: Path) -> dict:
-    """Build mapping of participant_id -> date folder."""
-    print("Building participant-to-date mapping...")
+def verify_participant_files(participant_id: str, expected_date: str, extracted_data_dir: Path) -> dict:
+    """
+    Verify participant files exist and validate location.
+
+    Returns dict with:
+        - status: 'matched_expected' | 'matched_relocated' | 'missing' | 'partial'
+        - date_folder: actual date folder (if found)
+        - expected_date: date from CSV
+        - metadata_date: date from metadata.json (if found)
+        - missing_audio: list of missing audio types
+        - date_mismatch: bool indicating if CSV date != actual location/metadata
+    """
+    result = {
+        'participant_id': participant_id,
+        'expected_date': expected_date,
+        'status': 'missing',
+        'date_folder': None,
+        'metadata_date': None,
+        'missing_audio': [],
+        'date_mismatch': False
+    }
+
+    # Step 1: Check expected location first
+    expected_folder = extracted_data_dir / expected_date / participant_id
+    participant_folder = None
+
+    if expected_folder.exists() and expected_folder.is_dir():
+        participant_folder = expected_folder
+        result['date_folder'] = expected_date
+    else:
+        # Step 2: Search recursively for participant folder
+        date_folders = sorted([d for d in extracted_data_dir.iterdir() if d.is_dir()])
+        for date_folder in date_folders:
+            candidate = date_folder / participant_id
+            if candidate.exists() and candidate.is_dir():
+                participant_folder = candidate
+                result['date_folder'] = date_folder.name
+                result['date_mismatch'] = True
+                break
+
+    if not participant_folder:
+        return result  # Status remains 'missing'
+
+    # Step 3: Validate metadata.json if exists
+    metadata_json = participant_folder / 'metadata.json'
+    if metadata_json.exists():
+        try:
+            with open(metadata_json, 'r') as f:
+                metadata = json.load(f)
+                if 'date' in metadata:
+                    result['metadata_date'] = metadata['date']
+                    # Extract date portion (YYYY-MM-DD) from ISO format
+                    metadata_date_str = metadata['date'][:10].replace('-', '')
+
+                    # If metadata date differs from CSV, flag it
+                    if metadata_date_str != expected_date:
+                        result['date_mismatch'] = True
+                        # Use the date from the folder location (already set in date_folder)
+        except Exception as e:
+            # Failed to parse metadata.json, continue without it
+            pass
+
+    # Step 4: Check all audio files exist
+    missing_audio = []
+    for audio_type in AUDIO_TYPES:
+        audio_file = participant_folder / f"{audio_type}.wav"
+        if not audio_file.exists():
+            missing_audio.append(audio_type)
+
+    result['missing_audio'] = missing_audio
+
+    # Determine final status
+    if len(missing_audio) == len(AUDIO_TYPES):
+        result['status'] = 'missing'  # No audio files found
+    elif len(missing_audio) > 0:
+        result['status'] = 'partial'  # Some audio files missing
+    elif result['date_mismatch']:
+        result['status'] = 'matched_relocated'  # Found but at wrong location/date
+    else:
+        result['status'] = 'matched_expected'  # Everything matches
+
+    return result
+
+
+def build_participant_date_mapping(metadata_df: pd.DataFrame, extracted_data_dir: Path) -> tuple:
+    """
+    Build mapping of participant_id -> date folder with verification.
+
+    Returns:
+        - mapping: dict of participant_id -> date_folder
+        - verification_report: detailed verification results
+    """
+    print("Building participant-to-date mapping with verification...")
 
     mapping = {}
-    date_folders = sorted([d for d in extracted_data_dir.iterdir() if d.is_dir()])
+    verification_results = []
 
-    for date_folder in tqdm(date_folders, desc="Scanning date folders"):
-        date_str = date_folder.name
-        participant_folders = [p for p in date_folder.iterdir() if p.is_dir()]
+    # Process each participant from metadata
+    for _, row in tqdm(metadata_df.iterrows(), total=len(metadata_df), desc="Verifying participants"):
+        participant_id = row['id']
+        expected_date = str(row['record_date']).replace('-', '')  # Convert YYYY-MM-DD to YYYYMMDD
 
-        for participant_folder in participant_folders:
-            participant_id = participant_folder.name
-            if participant_id in mapping:
-                print(f"Warning: Duplicate participant {participant_id} found in {date_str} and {mapping[participant_id]}")
-            mapping[participant_id] = date_str
+        # Verify files
+        result = verify_participant_files(participant_id, expected_date, extracted_data_dir)
+        verification_results.append(result)
 
-    print(f"Mapped {len(mapping)} participants to date folders")
-    return mapping
+        # Add to mapping if found (excluding fully missing)
+        if result['status'] != 'missing':
+            mapping[participant_id] = result['date_folder']
+
+    # Generate summary statistics
+    status_counts = {}
+    for result in verification_results:
+        status = result['status']
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    verification_report = {
+        'total_participants': len(metadata_df),
+        'status_summary': status_counts,
+        'mapped_participants': len(mapping),
+        'details': verification_results
+    }
+
+    print(f"\nVerification Summary:")
+    print(f"  Total participants: {verification_report['total_participants']}")
+    print(f"  Matched at expected location: {status_counts.get('matched_expected', 0)}")
+    print(f"  Matched but relocated: {status_counts.get('matched_relocated', 0)}")
+    print(f"  Partially missing audio: {status_counts.get('partial', 0)}")
+    print(f"  Completely missing: {status_counts.get('missing', 0)}")
+    print(f"  Successfully mapped: {len(mapping)}")
+
+    return mapping, verification_report
 
 
 def create_stratified_splits(df: pd.DataFrame, test_size_val: float, test_size_test: float, random_state: int):
@@ -212,15 +325,12 @@ def main():
 
     print(f"Merged dataset has {len(metadata_with_quality)} rows and {len(metadata_with_quality.columns)} columns")
 
-    # Step 4: Build participant-to-date mapping
-    print("\n[4/5] Building participant-to-date mapping...")
-    participant_date_mapping = build_participant_date_mapping(extracted_data_dir)
-
-    # Verify all participants have a date mapping
-    missing_mapping = set(metadata_with_quality['id']) - set(participant_date_mapping.keys())
-    if missing_mapping:
-        print(f"Warning: {len(missing_mapping)} participants not found in Extracted_data/")
-        print(f"  First 10: {list(missing_mapping)[:10]}")
+    # Step 4: Build participant-to-date mapping with verification
+    print("\n[4/5] Building participant-to-date mapping with verification...")
+    participant_date_mapping, verification_report = build_participant_date_mapping(
+        metadata_with_quality,
+        extracted_data_dir
+    )
 
     # Step 5: Create splits and batches
     print("\n[5/5] Creating splits and batches...")
@@ -256,6 +366,12 @@ def main():
         json.dump(participant_date_mapping, f, indent=2)
     print(f"✓ Saved participant-date mapping to {mapping_file}")
 
+    # Save verification report
+    verification_file = workspace / 'verification_report.json'
+    with open(verification_file, 'w') as f:
+        json.dump(verification_report, f, indent=2)
+    print(f"✓ Saved verification report to {verification_file}")
+
     # Save metadata with quality
     metadata_file = workspace / 'metadata_with_quality.csv'
     metadata_with_quality.to_csv(metadata_file, index=False)
@@ -267,6 +383,25 @@ def main():
     print("="*60)
     print(f"Total participants: {len(metadata_with_quality)}")
     print(f"Participants with date mapping: {len(participant_date_mapping)}")
+
+    # Verification details
+    status_summary = verification_report['status_summary']
+    print(f"\nFile Verification:")
+    print(f"  ✓ Matched at expected location: {status_summary.get('matched_expected', 0)}")
+    if status_summary.get('matched_relocated', 0) > 0:
+        print(f"  ⚠ Matched but relocated: {status_summary.get('matched_relocated', 0)} (date/location mismatch)")
+    if status_summary.get('partial', 0) > 0:
+        print(f"  ⚠ Partial audio files: {status_summary.get('partial', 0)} (some audio files missing)")
+    if status_summary.get('missing', 0) > 0:
+        print(f"  ✗ Completely missing: {status_summary.get('missing', 0)}")
+
+    # Show examples of relocated participants
+    relocated = [r for r in verification_report['details'] if r['status'] == 'matched_relocated']
+    if relocated:
+        print(f"\n  Examples of relocated participants (first 5):")
+        for r in relocated[:5]:
+            print(f"    - {r['participant_id']}: CSV date={r['expected_date']}, found in {r['date_folder']}")
+
     print(f"\nSplits:")
     for split_name, participant_ids in splits.items():
         n_batches = len(batches[split_name])
@@ -277,7 +412,8 @@ def main():
         print(f"\n⚠ Test mode enabled: only first {args.test_mode} batches per split will be processed")
 
     print("\n✓ Phase 1 complete!")
-    print(f"\nNext step: Run 02_process_audio_batch.py --workspace {args.workspace}")
+    print(f"\nVerification report saved to: {verification_file}")
+    print(f"Next step: Run 02_process_audio_batch.py --workspace {args.workspace}")
 
 
 if __name__ == '__main__':

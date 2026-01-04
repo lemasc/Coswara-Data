@@ -10,8 +10,6 @@
 6. [Execution Workflow](#execution-workflow)
 7. [Technical Details](#technical-details)
 8. [Output Structure](#output-structure)
-9. [Troubleshooting](#troubleshooting)
-10. [Memory and Performance](#memory-and-performance)
 
 ---
 
@@ -26,6 +24,7 @@ The pipeline is designed for memory-efficient processing of 2,746 participants w
 
 ### Design Principles
 
+- **File verification**: Robust participant location with recursive search to handle date/location mismatches
 - **Batch processing**: Process data in small batches (default: 50 participants) to manage memory
 - **Resumability**: Each batch saved independently, allowing restart from any point
 - **Validation**: Comprehensive checks at each phase
@@ -108,7 +107,12 @@ Phase 1: Data Preparation
 ├─ Load combined_data.csv (2,746 participants)
 ├─ Load 9 annotation files (quality labels)
 ├─ Merge metadata + quality scores
-├─ Build participant-to-date mapping
+├─ Verify participant files and build date mapping
+│  ├─ Check expected location from CSV date
+│  ├─ Recursively search if not found
+│  ├─ Validate metadata.json dates
+│  ├─ Check all audio files exist
+│  └─ Generate verification report
 ├─ Create stratified train/val/test splits (70/15/15)
 └─ Generate batches (50 participants each)
 
@@ -174,6 +178,7 @@ workspace/
 ├── splits.json                    # Participant IDs by split
 ├── batches.json                   # Batch assignments
 ├── participant_date_mapping.json  # Participant → date folder lookup
+├── verification_report.json       # Phase 1 file verification results
 ├── audio_summary.json             # Phase 2a statistics
 ├── validation_report.json         # Phase 2b results
 ├── metadata_summary.json          # Phase 3 statistics
@@ -234,13 +239,23 @@ workspace/
 1. Loads `combined_data.csv` (2,746 participants)
 2. Loads 9 annotation files from `annotations/`
 3. Merges metadata with quality scores (adds 9 quality columns)
-4. Scans `Extracted_data/` to build participant → date folder mapping
+4. Verifies participant files and builds date mapping:
+   - Checks expected location from CSV `record_date` first
+   - If not found, recursively searches all date folders in `Extracted_data/`
+   - Validates `metadata.json` date field when present
+   - Checks all 9 audio file types exist (without reading)
+   - Categorizes each participant:
+     - `matched_expected`: Found at expected location
+     - `matched_relocated`: Found but at different date folder
+     - `partial`: Found but missing some audio files
+     - `missing`: Not found or no audio files
 5. Creates stratified 70/15/15 splits by `covid_status`
 6. Divides each split into batches of 50 participants
-7. Saves 4 files to workspace:
+7. Saves 5 files to workspace:
    - `splits.json` - Participant IDs by split
    - `batches.json` - Batch assignments with participant lists
    - `participant_date_mapping.json` - Date folder lookup
+   - `verification_report.json` - File verification results
    - `metadata_with_quality.csv` - Full metadata with quality scores
 
 **Example**:
@@ -256,7 +271,12 @@ python 01_prepare_splits.py --workspace ./workspace --test-mode 2
 **Output validation**:
 
 - Prints COVID status distribution across splits (should be ~equal)
-- Warns if participants missing from `Extracted_data/`
+- Shows verification summary:
+  - Matched at expected location: ~587 participants (21%)
+  - Matched but relocated: ~2,157 participants (79%)
+  - Partially missing audio: ~2 participants
+  - Completely missing: 0 participants
+- Lists examples of relocated participants with date mismatches
 - Shows batch counts: train (~39 batches), val (~9 batches), test (~9 batches)
 
 ---
@@ -618,6 +638,31 @@ python 03_validate_batches.py --workspace ./workspace
 
 ## Technical Details
 
+### File Verification and Date Mapping
+
+**Challenge**: The dataset contains date/location mismatches where participant folders are stored in different date directories than recorded in `combined_data.csv`.
+
+**Statistics**: ~79% of participants (2,157 out of 2,746) have date mismatches between CSV records and actual file locations.
+
+**Verification Process**:
+
+1. **Expected location check**: For each participant, first check `Extracted_data/{CSV_date}/{participant_id}/`
+2. **Recursive search**: If not found, scan all date folders to locate the participant
+3. **Metadata validation**: If `metadata.json` exists in the folder, extract and compare the date field
+4. **Audio file verification**: Check existence of all 9 audio file types (`.wav` files)
+5. **Status classification**:
+   - `matched_expected`: Found at expected location with all files
+   - `matched_relocated`: Found at different location than CSV indicates
+   - `partial`: Found but missing some audio files
+   - `missing`: Not found or no audio files present
+
+**Benefits**:
+- Reduces NULL audio records in Phase 2 by correctly locating misplaced files
+- Documents data quality issues for research transparency
+- Enables 100% participant mapping (2,746/2,746) despite mismatches
+
+---
+
 ### Stratified Splitting
 
 **Goal**: Maintain COVID status distribution across all splits
@@ -761,6 +806,7 @@ workspace/
 ├── splits.json                    # {"train": [...], "val": [...], "test": [...]}
 ├── batches.json                   # {"train": [{batch_id, participants, count}, ...], ...}
 ├── participant_date_mapping.json  # {participant_id: date_folder, ...}
+├── verification_report.json       # Phase 1 file verification results
 ├── audio_summary.json             # Phase 2a statistics
 ├── validation_report.json         # Phase 2b results
 ├── metadata_summary.json          # Phase 3 statistics
@@ -783,6 +829,46 @@ workspace/
         ├── ...
         └── audio-test-00009.parquet
 ```
+
+### Verification Report Format
+
+The `verification_report.json` file contains detailed results of Phase 1 file verification:
+
+```json
+{
+  "total_participants": 2746,
+  "status_summary": {
+    "matched_expected": 587,      // Found at expected location from CSV
+    "matched_relocated": 2157,    // Found but at different date folder
+    "partial": 2,                  // Found but missing some audio files
+    "missing": 0                   // Not found or no audio files
+  },
+  "mapped_participants": 2746,
+  "details": [
+    {
+      "participant_id": "94OSQGpJCiSuQtHifnlYyOIKL0E2",
+      "expected_date": "20210403",           // Date from CSV
+      "status": "matched_relocated",
+      "date_folder": "20210406",             // Actual folder location
+      "metadata_date": "2021-04-15T11:10:03.756Z",  // From metadata.json (if present)
+      "missing_audio": [],                   // List of missing audio types
+      "date_mismatch": true                  // CSV date != actual location
+    },
+    ...
+  ]
+}
+```
+
+**Status categories**:
+- **matched_expected**: Participant found at expected location, all audio files present
+- **matched_relocated**: Participant found but CSV date doesn't match folder location
+- **partial**: Participant found but missing some audio files
+- **missing**: Participant folder not found or contains no audio files
+
+**Use cases**:
+- Identify date/location mismatches for data quality analysis
+- Find participants with incomplete audio recordings
+- Document discrepancies between CSV metadata and actual file locations
 
 ### HuggingFace Dataset
 
