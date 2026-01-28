@@ -59,7 +59,7 @@ def load_and_resample_audio(audio_path: Path, target_sr: int = TARGET_SR) -> tup
             return None, None, "Empty audio file"
 
         # Resample to target 16kHz if needed
-        if sr != target_sr:
+        if target_sr is not None and sr != target_sr:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
 
         return audio, target_sr, None
