@@ -3,3 +3,5 @@ extracted*/
 lifesignals/
 filtered*
 venv/
+.cache/
+sound_category_models/
